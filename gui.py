@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import sys
 from pathlib import Path
 
 import customtkinter as ctk
@@ -48,7 +47,7 @@ def get_config_path() -> str:
         base_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "aiuDecrypt")
     else:
         base_dir = os.path.join(os.path.expanduser("~"), ".config", "aiuDecrypt")
-    
+
     os.makedirs(base_dir, exist_ok=True)
     return os.path.join(base_dir, "config.json")
 
@@ -77,6 +76,21 @@ def existing_dir(path: str) -> str | None:
     if p.parent.is_dir() and p.parent != Path("."):
         return str(p.parent)
     return None
+
+
+def collect_files(folder: str) -> list[str]:
+    """Klasördeki (alt klasörlere girmeden) şifreli paket dosyalarını döndürür.
+    .apkg uzantılı dosya varsa sadece onları, yoksa gizli olmayan tüm dosyaları alır."""
+    try:
+        items = sorted(
+            (p for p in Path(folder).iterdir()
+             if p.is_file() and not p.name.startswith(".")),
+            key=lambda p: p.name.lower(),
+        )
+    except Exception:
+        return []
+    apkg = [p for p in items if p.suffix.lower() == ".apkg"]
+    return [p.as_posix() for p in (apkg or items)]
 
 
 def ghost_button(parent, text, command, width=100, height=36, accent=True, **kw):
@@ -247,6 +261,10 @@ class DecryptorApp(ctk.CTk):
         self._busy = False
         self._settings_win: SettingsWindow | None = None
 
+        # Toplu seçim durumu
+        self.selected_files: list[str] = []
+        self._selection_label = ""   # Entry'de gösterilen "N dosya seçildi" metni
+
         self._build_ui()
         self._load_config()
 
@@ -291,7 +309,7 @@ class DecryptorApp(ctk.CTk):
         ).pack(anchor="w")
         ctk.CTkLabel(
             title_box,
-            text="Şifreli bölüm dosyasını ve hedef klasörü seç; video ve altyazılar çıkarılsın.",
+            text="Şifreli bölüm dosyasını (veya birden fazlasını) ve hedef klasörü seç.",
             font=ctk.CTkFont(FONT, 13),
             text_color=MUTED,
         ).pack(anchor="w", pady=(2, 0))
@@ -311,14 +329,17 @@ class DecryptorApp(ctk.CTk):
         cards.grid_columnconfigure(0, weight=1)
 
         self.entry_file = self._path_card(
-            cards, 0, "1", "Şifreli dosya",
-            "Dosya seç veya yolu yapıştır…", "Dosya Seç",
-            self._select_encrypted_file,
+            cards, 0, "1", "Şifreli dosya(lar)",
+            "Dosya(lar) seç, klasör seç veya yolu yapıştır…",
+            [
+                ("Dosya(lar)", self._select_encrypted_files),
+                ("Klasör", self._select_input_folder),
+            ],
         )
         self.entry_output = self._path_card(
             cards, 1, "2", "Hedef klasör",
-            "Dosyaların çıkarılacağı klasör…", "Klasör Seç",
-            self._select_output_dir,
+            "Dosyaların çıkarılacağı klasör…",
+            [("Klasör Seç", self._select_output_dir)],
         )
 
         # Seçenekler
@@ -433,7 +454,8 @@ class DecryptorApp(ctk.CTk):
 
         self._log("Uygulama hazır.", "info")
 
-    def _path_card(self, parent, row, step, title, placeholder, button_text, command):
+    def _path_card(self, parent, row, step, title, placeholder, buttons):
+        """buttons: [(metin, komut), ...] — kartın sağında yan yana dizilir."""
         card = ctk.CTkFrame(
             parent,
             fg_color=CARD,
@@ -458,9 +480,12 @@ class DecryptorApp(ctk.CTk):
         entry = styled_entry(card, placeholder)
         entry.grid(row=1, column=1, sticky="ew", pady=(4, 14))
 
-        ghost_button(card, button_text, command).grid(
-            row=1, column=2, padx=(10, 16), pady=(4, 14)
-        )
+        btn_box = ctk.CTkFrame(card, fg_color="transparent")
+        btn_box.grid(row=1, column=2, padx=(10, 16), pady=(4, 14))
+        for i, (text, command) in enumerate(buttons):
+            ghost_button(btn_box, text, command, width=90 if len(buttons) > 1 else 100).pack(
+                side="left", padx=(0 if i == 0 else 8, 0)
+            )
         return entry
 
     # ───── ayarlar / config ─────
@@ -476,7 +501,7 @@ class DecryptorApp(ctk.CTk):
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.last_input_dir = data.get("last_input_dir", "")
-                    
+
                     last_out = data.get("last_output_dir", "")
                     if last_out and os.path.exists(last_out):
                         self.entry_output.delete(0, "end")
@@ -521,6 +546,9 @@ class DecryptorApp(ctk.CTk):
         self.status_label.configure(text=text)
         self.status_dot.configure(text_color=color)
 
+    def _set_status_safe(self, text: str, color: str):
+        self.after(0, lambda: self._set_status(text, color))
+
     def _set_busy(self, busy: bool):
         self._busy = busy
         if busy:
@@ -540,36 +568,64 @@ class DecryptorApp(ctk.CTk):
             self._log("[!] Açılacak geçerli bir hedef klasör yok.", "warn")
 
     # ───── seçiciler ─────
-    def _select_encrypted_file(self):
-        initial_dir = (
-            self.last_input_dir
-            if (self.last_input_dir and os.path.exists(self.last_input_dir))
-            else os.getcwd()
-        )
+    def _set_selection(self, files: list[str]):
+        """Seçilen dosyaları kaydeder, entry'yi ve varsayılan hedef klasörü günceller."""
+        files = [Path(f).as_posix() for f in files]
+        self.selected_files = files
+        self.last_input_dir = Path(files[0]).parent.as_posix()
 
-        file_path = filedialog.askopenfilename(
-            title="Şifreli Dosya Seç",
-            initialdir=initial_dir,
+        self.entry_file.delete(0, "end")
+        if len(files) == 1:
+            self._selection_label = ""
+            self.entry_file.insert(0, files[0])
+        else:
+            self._selection_label = f"{len(files)} dosya seçildi"
+            self.entry_file.insert(0, self._selection_label)
+            self._log(f"\n[+] {len(files)} dosya seçildi:", "info")
+            for f in files:
+                self._log(f"    • {Path(f).name}", "info")
+
+        # Hedef dizin boşsa varsayılan öner
+        if not self.entry_output.get().strip():
+            first = Path(files[0])
+            if len(files) == 1:
+                default_dir = (first.parent / first.stem).as_posix()
+            else:
+                # Toplu işlemde her dosya kendi alt klasörüne çıkarılır
+                default_dir = first.parent.as_posix()
+            self.entry_output.delete(0, "end")
+            self.entry_output.insert(0, default_dir)
+
+        self._save_config()
+
+    def _initial_input_dir(self) -> str:
+        if self.last_input_dir and os.path.exists(self.last_input_dir):
+            return self.last_input_dir
+        return os.getcwd()
+
+    def _select_encrypted_files(self):
+        """Tek veya çoklu dosya seçimi (Ctrl / Shift ile)."""
+        paths = filedialog.askopenfilenames(
+            title="Şifreli Dosya(lar) Seç",
+            initialdir=self._initial_input_dir(),
             filetypes=[("Tüm Dosyalar", "*.*"), ("APKG Dosyaları", "*.apkg")],
         )
-        if file_path:
-            file_obj = Path(file_path)
-            clean_file_path = file_obj.as_posix()
+        if paths:
+            self._set_selection(list(paths))
 
-            # 1. Dosya seçici için bağımsız klasör hafızasını güncelle
-            self.last_input_dir = file_obj.parent.as_posix()
-
-            self.entry_file.delete(0, "end")
-            self.entry_file.insert(0, clean_file_path)
-
-            # 2. Hedef dizin boşsa: Dosya adıyla aynı bir alt klasör yolu oluştur
-            if not self.entry_output.get().strip():
-                default_dir = (file_obj.parent / file_obj.stem).as_posix()
-                self.entry_output.delete(0, "end")
-                self.entry_output.insert(0, default_dir)
-
-            # Değişiklikleri config.json'a kaydet
-            self._save_config()
+    def _select_input_folder(self):
+        """Klasördeki tüm şifreli dosyaları seç."""
+        folder = filedialog.askdirectory(
+            title="Şifreli Dosyaların Olduğu Klasörü Seç",
+            initialdir=self._initial_input_dir(),
+        )
+        if not folder:
+            return
+        files = collect_files(folder)
+        if not files:
+            self._log(f"[!] Klasörde dosya bulunamadı: {folder}", "warn")
+            return
+        self._set_selection(files)
 
     def _select_output_dir(self):
         current_val = self.entry_output.get().strip()
@@ -583,17 +639,34 @@ class DecryptorApp(ctk.CTk):
             self.entry_output.delete(0, "end")
             self.entry_output.insert(0, clean_dir)
             self._save_config()
-            
+
+    def _resolve_inputs(self) -> list[str]:
+        """Entry'deki değeri işlenecek dosya listesine çevirir."""
+        text = self.entry_file.get().strip().strip('"')
+        if not text:
+            return []
+
+        # Butonlarla yapılan çoklu seçim
+        if self.selected_files and text == self._selection_label:
+            return [f for f in self.selected_files if os.path.isfile(f)]
+
+        # Elle yazılan/yapıştırılan yol: klasör ya da dosya olabilir
+        if os.path.isdir(text):
+            return collect_files(text)
+        if os.path.isfile(text):
+            return [Path(text).as_posix()]
+        return []
+
     # ───── iş akışı ─────
     def _start_decryption(self):
         if self._busy:
             return
 
-        file_path = self.entry_file.get().strip()
+        files = self._resolve_inputs()
         output_dir = self.entry_output.get().strip()
 
-        if not file_path or not os.path.exists(file_path):
-            self._log("[-] Hata: Lütfen geçerli bir şifreli dosya seçin!", "err")
+        if not files:
+            self._log("[-] Hata: Lütfen geçerli bir şifreli dosya veya klasör seçin!", "err")
             self._set_status("Geçersiz dosya", ERROR)
             return
 
@@ -609,7 +682,7 @@ class DecryptorApp(ctk.CTk):
             self._set_status("Hedef klasör hatası", ERROR)
             return
 
-        self.config["last_input_dir"] = str(Path(file_path).parent)
+        self.last_input_dir = str(Path(files[0]).parent)
         self._save_config()
 
         # Arayüz değerlerini ana thread'de oku, arka plana parametre olarak ver
@@ -619,64 +692,99 @@ class DecryptorApp(ctk.CTk):
         self._set_busy(True)
         threading.Thread(
             target=self._run_async_decrypt,
-            args=(file_path, output_dir, embed, ffmpeg),
+            args=(files, output_dir, embed, ffmpeg),
             daemon=True,
         ).start()
 
-    def _run_async_decrypt(self, file_path, output_dir, embed, ffmpeg):
+    def _run_async_decrypt(self, files, output_dir, embed, ffmpeg):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         ok = False
+        msg = "Hata oluştu"
         try:
-            ok = loop.run_until_complete(
-                self._async_decrypt_process(file_path, output_dir)
+            ok, msg = loop.run_until_complete(
+                self._async_batch_process(files, output_dir, embed, ffmpeg)
             )
+        except Exception as ex:
+            self._log_safe(f"[-] Beklenmeyen hata: {ex}", "err")
         finally:
             loop.close()
-            self.after(0, lambda: self._finish(ok))
+            self.after(0, lambda: self._finish(ok, msg))
 
-    def _finish(self, ok: bool):
+    def _finish(self, ok: bool, msg: str):
         self._set_busy(False)
-        self._set_status("Tamamlandı" if ok else "Hata oluştu", SUCCESS if ok else ERROR)
+        self._set_status(msg, SUCCESS if ok else ERROR)
 
-    async def _async_decrypt_process(self, file_path: str, output_dir: str):
+    async def _async_batch_process(self, files, output_dir, embed, ffmpeg):
+        total = len(files)
+        batch = total > 1
+        succeeded = 0
+        failed: list[str] = []
+
+        for i, file_path in enumerate(files, start=1):
+            name = Path(file_path).name
+            if batch:
+                self._set_status_safe(f"İşleniyor… ({i}/{total})", WARN)
+                self._log_safe(f"\n━━ [{i}/{total}] {name} ━━", "info")
+                # Her dosya kendi alt klasörüne çıkarılır
+                target_dir = (Path(output_dir) / Path(file_path).stem).as_posix()
+            else:
+                target_dir = output_dir
+
+            if await self._process_one(file_path, target_dir, embed, ffmpeg):
+                succeeded += 1
+            else:
+                failed.append(name)
+
+        if batch:
+            if failed:
+                self._log_safe(
+                    f"\n[!] Toplu işlem bitti: {succeeded}/{total} başarılı. "
+                    f"Sorunlu dosyalar: {', '.join(failed)}",
+                    "warn",
+                )
+            else:
+                self._log_safe(f"\n[✓] Toplu işlem tamamlandı: {total}/{total} dosya.", "ok")
+
+        ok = not failed
+        if ok:
+            return True, "Tamamlandı"
+        return False, f"{len(failed)} dosyada hata" if batch else "Hata oluştu"
+
+    async def _process_one(self, file_path: str, output_dir: str, embed: bool, ffmpeg: str) -> bool:
         try:
             file_name = Path(file_path).stem
             self.after(0, lambda: self._log(f"\n[+] '{file_name}' işleniyor..."))
 
-            # --- YENİ EKLENEN KISIMLAR ---
-            # 1. Ana hedef klasörü oluştur
-            os.makedirs(output_dir, exist_ok=True)
+            # Yol ayracını normalize et (Windows'ta \ ve / karışmasın)
+            output_dir = Path(output_dir).as_posix()
 
-            # 2. Altyazılar için 'altyazilar' alt klasörü oluştur
+            # Ana hedef klasör + altyazılar alt klasörü
+            os.makedirs(output_dir, exist_ok=True)
             subtitles_dir = os.path.join(output_dir, "altyazilar")
             os.makedirs(subtitles_dir, exist_ok=True)
-            # ------------------------------
 
             result = await self.service.decrypt_episode_async(file_path)
-            copied_count = 0
 
-            # 1. Altyazıları 'subtitles' alt klasörüne kopyala (.vtt)
+            # 1. Altyazıları 'altyazilar' alt klasörüne kopyala (.vtt)
             saved_subs = []
             for sub in result.subtitle_files:
                 if os.path.exists(sub.path):
-                    # Yolu 'subtitles_dir' içine verecek şekilde değiştirdik
                     target_sub = os.path.join(
                         subtitles_dir, f"{file_name}_{sub.language}.vtt"
                     )
                     shutil.copyfile(sub.path, target_sub)
-                    
+
                     # FFmpeg'in yeni altyazı yolunu bulması için güncelliyoruz
                     sub.path = target_sub
                     saved_subs.append(sub)
-                    
+
                     self.after(
                         0,
                         lambda s=target_sub: self._log(
                             f" -> Altyazı çıkarıldı: altyazilar/{Path(s).name}"
                         ),
                     )
-                    copied_count += 1
 
             # 2. Videoyu çıkar (.mp4)
             target_video = None
@@ -688,8 +796,7 @@ class DecryptorApp(ctk.CTk):
             all_ok = True
 
             # 3. Seçiliyse FFmpeg ile videoya göm (.mkv)
-            should_embed = bool(self.chk_embed_subtitles.get())
-            if should_embed and target_video and saved_subs:
+            if embed and target_video and saved_subs:
                 self.after(
                     0,
                     lambda: self._log(" -> FFmpeg ile altyazılar birleştiriliyor..."),
@@ -697,7 +804,7 @@ class DecryptorApp(ctk.CTk):
                 output_mkv = os.path.join(output_dir, f"{file_name}_altyazili.mkv")
 
                 success, err_details = await self.service.embed_subtitles_async(
-                    target_video, saved_subs, output_mkv, self.ffmpeg_path
+                    target_video, saved_subs, output_mkv, ffmpeg
                 )
 
                 if success:
@@ -715,21 +822,21 @@ class DecryptorApp(ctk.CTk):
                             f" [-] FFmpeg Hatası: {err}"
                         ),
                     )
-            
+
             if all_ok:
                 self._log_safe(
-                    f"[✓] İşlem tamamlandı! Çıktı dizini: '{output_dir}'", "ok"
+                    f"[✓] '{file_name}' tamamlandı! Çıktı dizini: '{output_dir}'", "ok"
                 )
             else:
                 self._log_safe(
-                    "[!] Dosyalar çıkarıldı ancak altyazı gömme başarısız oldu.", "warn"
+                    f"[!] '{file_name}' çıkarıldı ancak altyazı gömme başarısız oldu.", "warn"
                 )
-            return all_ok 
+            return all_ok
 
         except Exception as ex:
-            msg = str(ex)
-            self._log_safe(f"[-] Çözme hatası: {msg}", "err")
+            self._log_safe(f"[-] Çözme hatası ({Path(file_path).name}): {ex}", "err")
             return False
+
 
 if __name__ == "__main__":
     app = DecryptorApp()
