@@ -1,6 +1,6 @@
 # AIU Decrypt
 
-Bu aracı kullanarak 'belirli bir algoritmayla' şifrelenmiş dosyaların şifresini çözüp içeriğini çıkarabilirsiniz.
+Bu aracı kullanarak 'spesifik bir algoritmayla' şifrelenmiş dosyaların şifresini çözüp içeriğini çıkarabilirsiniz. Yani herhangi bir şifreli dosyayı çözemez, sabit bir çözme algoritması kullanır.
 
 ## Kurulum
 
