@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import uuid
 import zipfile
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -210,11 +211,27 @@ class PackageDecryptionService:
             # Kalite kaybı olmadan kopyala, altyazıları srt olarak MKV içine göm
             cmd.extend(["-c:v", "copy", "-c:a", "copy", "-c:s", "srt", out_path])
 
+            # Windows'ta ffmpeg için konsol penceresini gizle
+            creationflags = 0
+            startupinfo = None
+            if sys.platform == "win32":
+                creationflags = subprocess.CREATE_NO_WINDOW
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
             result = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                check=True,
+                creationflags=creationflags,
+                startupinfo=startupinfo,
             )
             return result
-
+        
         try:
             await asyncio.to_thread(_run_ffmpeg)
             return True, ""
